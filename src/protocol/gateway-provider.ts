@@ -1,18 +1,25 @@
-import { Agreement, DeploymentStatus } from "@forest-protocols/sdk";
 import {
-  BaseExampleServiceProvider,
-  ExampleResourceDetails,
-} from "./base-provider";
+  Agreement,
+  DeploymentStatus,
+  PipeError,
+  PipeResponseCodes,
+  PipeResponseCodeType,
+} from "@forest-protocols/sdk";
 import { DetailedOffer, Resource } from "@/types";
 import { z } from "zod";
 import { VirtualProviderConfigurationInformation } from "@/abstract/AbstractProvider";
+import {
+  ScorePredictionResourceDetails,
+  ScorePredictionServiceProvider,
+} from "./base-provider";
+import { makePredictionRequest } from "./utils";
 
 /**
  * Gateway Provider (gPROV) is a Provider type that acts as a gateway for its
  * implementation with a set of configuration to the Virtual Providers (vPROV)
  * that are registered on it. You can find an example implementation of a gPROV right below.
  */
-export class GatewayProviderImplementation extends BaseExampleServiceProvider {
+export class GatewayProviderImplementation extends ScorePredictionServiceProvider {
   /**
    * Returns what kind of configuration can be applied by a vPROV. The returned
    * object will be used to show vPROVs to inform them about what configurations
@@ -24,17 +31,17 @@ export class GatewayProviderImplementation extends BaseExampleServiceProvider {
     VirtualProviderConfigurationInformation
   > {
     return {
-      size: {
-        example: "10g or 512m",
-        format: "<number>[g|m]",
-        description: "Disk size of the Resource",
+      apiBaseURL: {
+        example: "https://api.score-prediction.net",
+        format: "http(s)://<address>(port if needed)",
+        description:
+          "The API that will be used for the predictions. Must be compatible with Prediction API spec",
         required: true,
       },
-      region: {
-        example: "eu",
-        format: ["eu", "as", "us"],
-        description: "Region that the Resource will be provisioned in",
-        default: "eu",
+      apiKey: {
+        example: "4vXK8xf3wTYJzVk18ADtoRkhblC79gvgZ0XhEFPc", // Example key
+        description: `API key that will be included in the "Authorization" header`,
+        required: true,
       },
     };
   }
@@ -44,117 +51,83 @@ export class GatewayProviderImplementation extends BaseExampleServiceProvider {
    */
   get virtualProviderConfigurationSchema() {
     return z.object({
-      region: z.enum(["eu", "as", "us"]).default("eu"),
-
-      // `size` field has its own format so we are parsing it with `.transform` method.
-      size: z.string().transform((value, ctx) => {
-        const multiplier = value[value.length - 1].toLowerCase();
-        const num = Number(value.slice(0, value.length - 1));
-
-        if (isNaN(num)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: "Invalid size number",
-          });
-          return z.NEVER;
-        }
-
-        if (!multiplier || !["g", "m"].includes(multiplier)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message:
-              'Invalid size multiplier. Must be "g" for gigabyte or "m" for megabyte',
-          });
-          return z.NEVER;
-        }
-
-        if (multiplier === "g") {
-          return num * 1024 * 1024;
-        } else {
-          // Megabyte
-          return num * 1024;
-        }
-      }),
+      apiBaseURL: z.string().url(),
+      apiKey: z.string(),
     });
   }
 
-  async doSomething(
+  async predictFixtureResults(
     agreement: Agreement,
     resource: Resource,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    additionalArgument: string
-  ): Promise<{ stringResult: string; numberResult: number }> {
-    // This is the Protocol level method that all the Providers have to
-    // implement. Since we are a gPROV, we need to implement it in a way
-    // that supports vPROVs.
+    challenges: string
+  ): Promise<{ predictions: string; responseCode: PipeResponseCodeType }> {
+    // Find the configuration of the Offer
+    const configuration = await this.getVirtualProviderConfiguration(
+      agreement.offerId,
+      this.protocol.address
+    );
 
-    // First find out which vPROV is responsible for this Resource
-    const vprov = this.virtualProviders.findByResource(resource);
-
-    // If we find it, we can simply continue to the implementation
-    if (vprov) {
-      // Find the meaning of the life...
-      const result =
-        0b101010 - (crypto.getRandomValues(new Uint8Array(1))[0] & 1);
-
-      // You can also fetch the configuration that has been made for the Offer
-      // that is being used by this Resource:
-      const configuration = await this.getVirtualProviderConfiguration(
-        agreement.offerId,
-        this.protocol.address
-      );
-
-      return {
-        numberResult: result * configuration.size,
-        stringResult: `According to ${resource.name} by Virtual Provider ${vprov.actor.ownerAddr}, the meaning of the life is ${result}`,
-      };
+    // Check the existence of the configuration
+    if (!configuration) {
+      throw new PipeError(PipeResponseCodes.INTERNAL_SERVER_ERROR, {
+        message: "Configuration of the Offer is not found",
+      });
     }
 
-    // What if the Resource is not associated with one of the vPROVs?
-    // In that case it's depend on the implementation. If you would like to
-    // use gPROV as a regular Provider, you can implement here or simply you
-    // can throw an error if you wouldn't like.
-    //
-    // NOTE: If you haven't registered any Offer for this gPROV, the workflow
-    //       never reaches at this point because the vPROV will always be found.
-    //       But it would be a good practice to add a throw statement to prevent
-    //       untraceable behaviors.
-    throw new Error(`The resource is controlled by a Virtual Provider`);
+    // Remove milliseconds from the kickoffTime string from each challenge
+    // Because some of the APIs may throw error because their parsing approaches
+    const objChallenges = JSON.parse(challenges) as { kickoffTime: string }[];
+    const challengesToPredict = JSON.stringify(
+      objChallenges.map((challenge) => {
+        return {
+          ...challenge,
+          kickoffTime:
+            // The only dot character that exists in the kickoffTime string is the dot character that separates the time and milliseconds.
+            new Date(challenge.kickoffTime).toISOString().split(".")[0] + "Z",
+        };
+      })
+    );
+
+    // Fetch predictions from Genius API
+    const apiResponse = await makePredictionRequest(
+      configuration.apiBaseURL,
+      configuration.apiKey,
+      challengesToPredict,
+      this.logger
+    );
+    return {
+      predictions: JSON.stringify(apiResponse),
+      responseCode: PipeResponseCodes.OK,
+    };
   }
 
   async create(
     agreement: Agreement,
     offer: DetailedOffer
-  ): Promise<ExampleResourceDetails> {
-    // Same example as `doSomething()` method.
-    // Find the vPROV and use it on the creation phase.
-    const vprov = this.virtualProviders.findByOffer(offer);
-
-    if (vprov) {
-      const configuration = await this.getVirtualProviderConfiguration(
-        agreement.offerId,
-        this.protocol.address
-      );
+  ): Promise<ScorePredictionResourceDetails> {
+    if (typeof offer.details == "object") {
+      const numberOfPredictions =
+        (
+          offer.details?.params["Number of Predictions"] as {
+            value: number;
+            unit: string;
+          }
+        )?.value || 0;
 
       return {
         status: DeploymentStatus.Running,
-        _examplePrivateDetailWontSentToUser: `Resource created by a Virtual Provider ${
-          vprov.actor.ownerAddr
-        } with the following configuration: ${JSON.stringify(configuration)}`,
-        Example_Detail: 42,
+        Predictions_Allowance_Count: numberOfPredictions,
+        Predictions_Count: 0,
       };
     }
-
-    // The Offer is not owned by a vPROV and as a gPROV, we are not supporting
-    // creating Resources by our owns (we only act as a "Gateway" for vPROVs)
-    throw new Error(`The Offer is not belong to any of the Virtual Providers`);
+    throw new Error("Invalid offer details");
   }
 
   async getDetails(
     agreement: Agreement,
     offer: DetailedOffer,
     resource: Resource
-  ): Promise<ExampleResourceDetails> {
+  ): Promise<ScorePredictionResourceDetails> {
     return {
       ...resource.details,
       status: resource.deploymentStatus,
